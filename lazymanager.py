@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import asyncio
 import json
 import subprocess
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Header, Footer, DataTable
+from textual.worker import Worker, WorkerState
 
 
 @dataclass
@@ -17,6 +19,10 @@ class Repository:
   name: str
   last_accessed: datetime | None = None
   last_commit: datetime | None = None
+  branch: str | None = None
+  status: str | None = None
+  ahead: int | None = None
+  behind: int | None = None
 
   @property
   def sort_key_name(self):
@@ -33,6 +39,19 @@ class Repository:
     if self.last_commit:
       return self.last_commit.timestamp()
     return 0
+
+  @property
+  def ahead_behind_display(self):
+    if self.ahead is None and self.behind is None:
+      return '...'
+    if self.ahead == 0 and self.behind == 0:
+      return '='
+    parts = []
+    if self.ahead and self.ahead > 0:
+      parts.append(f'↑{self.ahead}')
+    if self.behind and self.behind > 0:
+      parts.append(f'↓{self.behind}')
+    return ' '.join(parts) if parts else '='
 
 
 def get_config_path():
@@ -77,6 +96,58 @@ def get_last_commit_date(repo_path):
   return None
 
 
+def get_git_branch(repo_path):
+  try:
+    result = subprocess.run(
+      ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+      cwd=str(repo_path),
+      capture_output=True,
+      text=True,
+      timeout=1
+    )
+    if result.returncode == 0 and result.stdout.strip():
+      return result.stdout.strip()
+  except:
+    pass
+  return None
+
+
+def get_git_status(repo_path):
+  try:
+    result = subprocess.run(
+      ['git', 'status', '--porcelain'],
+      cwd=str(repo_path),
+      capture_output=True,
+      text=True,
+      timeout=1
+    )
+    if result.returncode == 0:
+      if not result.stdout.strip():
+        return 'clean'
+      return 'modified'
+  except:
+    pass
+  return None
+
+
+def get_git_ahead_behind(repo_path):
+  try:
+    result = subprocess.run(
+      ['git', 'rev-list', '--left-right', '--count', 'HEAD...@{upstream}'],
+      cwd=str(repo_path),
+      capture_output=True,
+      text=True,
+      timeout=1
+    )
+    if result.returncode == 0 and result.stdout.strip():
+      parts = result.stdout.strip().split()
+      if len(parts) == 2:
+        return int(parts[0]), int(parts[1])
+  except:
+    pass
+  return None, None
+
+
 def find_git_repos(base_path):
   repos = []
   base = Path(base_path)
@@ -93,8 +164,7 @@ def find_git_repos(base_path):
         repo = Repository(
           path=item,
           name=item.name,
-          last_accessed=access_history.get(str(item)),
-          last_commit=get_last_commit_date(item)
+          last_accessed=access_history.get(str(item))
         )
         repos.append(repo)
 
@@ -141,9 +211,12 @@ class LazyManagerApp(App):
       for repo in sorted_repos:
         last_accessed = repo.last_accessed.strftime('%Y-%m-%d %H:%M') if repo.last_accessed else 'Never'
         last_commit = repo.last_commit.strftime('%Y-%m-%d') if repo.last_commit else 'N/A'
-        table.add_row(repo.name, last_accessed, last_commit)
+        branch = repo.branch or '...'
+        status = repo.status or '...'
+        ahead_behind = repo.ahead_behind_display
+        table.add_row(repo.name, branch, status, ahead_behind, last_accessed, last_commit)
     else:
-      table.add_row(f'No git repositories found in {self.base_path}', '', '')
+      table.add_row(f'No git repositories found in {self.base_path}', '', '', '', '', '')
 
   def compose(self) -> ComposeResult:
     yield Header()
@@ -158,10 +231,12 @@ class LazyManagerApp(App):
     self.sub_title = 'Select a repository (sorted by last accessed)'
 
     table = self.query_one(DataTable)
-    table.add_columns('Repository', 'Last Accessed', 'Last Commit')
+    table.add_columns('Repository', 'Branch', 'Status', '↑↓', 'Last Accessed', 'Last Commit')
 
     self.repos = find_git_repos(self.base_path)
     self.refresh_list()
+
+    self.load_metadata_async()
 
   def action_navigate_down(self) -> None:
     table = self.query_one(DataTable)
@@ -185,6 +260,22 @@ class LazyManagerApp(App):
     self.sort_method = 'commit'
     self.sub_title = 'Select a repository (sorted by last commit)'
     self.refresh_list()
+
+  @staticmethod
+  def fetch_repo_metadata(repo: Repository) -> Repository:
+    repo.last_commit = get_last_commit_date(repo.path)
+    repo.branch = get_git_branch(repo.path)
+    repo.status = get_git_status(repo.path)
+    repo.ahead, repo.behind = get_git_ahead_behind(repo.path)
+    return repo
+
+  def load_metadata_async(self) -> None:
+    self.run_worker(self.load_all_metadata(), exclusive=False)
+
+  async def load_all_metadata(self) -> None:
+    for repo in self.repos:
+      await asyncio.to_thread(self.fetch_repo_metadata, repo)
+      self.refresh_list()
 
   def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
     sorted_repos = self.get_sorted_repos()
