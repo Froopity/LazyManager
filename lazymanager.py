@@ -23,6 +23,7 @@ class Repository:
   status: str | None = None
   ahead: int | None = None
   behind: int | None = None
+  is_loading: bool = False
 
   @property
   def sort_key_name(self):
@@ -54,14 +55,22 @@ class Repository:
     return ' '.join(parts) if parts else '='
 
 
-def get_config_path():
+def get_config_dir():
   config_dir = Path.home() / '.config' / 'lazymanager'
   config_dir.mkdir(parents=True, exist_ok=True)
-  return config_dir / 'access_history.json'
+  return config_dir
+
+
+def get_access_history_path():
+  return get_config_dir() / 'access_history.json'
+
+
+def get_metadata_cache_path():
+  return get_config_dir() / 'metadata_cache.json'
 
 
 def load_access_history():
-  config_path = get_config_path()
+  config_path = get_access_history_path()
   if not config_path.exists():
     return {}
 
@@ -74,9 +83,46 @@ def load_access_history():
 
 
 def save_access_history(history):
-  config_path = get_config_path()
+  config_path = get_access_history_path()
   data = {k: v.isoformat() for k, v in history.items()}
   with open(config_path, 'w') as f:
+    json.dump(data, f, indent=2)
+
+
+def load_metadata_cache():
+  cache_path = get_metadata_cache_path()
+  if not cache_path.exists():
+    return {}
+
+  try:
+    with open(cache_path, 'r') as f:
+      data = json.load(f)
+      result = {}
+      for repo_path, metadata in data.items():
+        result[repo_path] = {
+          'branch': metadata.get('branch'),
+          'status': metadata.get('status'),
+          'ahead': metadata.get('ahead'),
+          'behind': metadata.get('behind'),
+          'last_commit': datetime.fromisoformat(metadata['last_commit']) if metadata.get('last_commit') else None
+        }
+      return result
+  except:
+    return {}
+
+
+def save_metadata_cache(cache):
+  cache_path = get_metadata_cache_path()
+  data = {}
+  for repo_path, metadata in cache.items():
+    data[repo_path] = {
+      'branch': metadata.get('branch'),
+      'status': metadata.get('status'),
+      'ahead': metadata.get('ahead'),
+      'behind': metadata.get('behind'),
+      'last_commit': metadata['last_commit'].isoformat() if metadata.get('last_commit') else None
+    }
+  with open(cache_path, 'w') as f:
     json.dump(data, f, indent=2)
 
 
@@ -156,15 +202,22 @@ def find_git_repos(base_path):
     return repos
 
   access_history = load_access_history()
+  metadata_cache = load_metadata_cache()
 
   for item in base.iterdir():
     if item.is_dir():
       git_dir = item / '.git'
       if git_dir.exists():
+        cached = metadata_cache.get(str(item), {})
         repo = Repository(
           path=item,
           name=item.name,
-          last_accessed=access_history.get(str(item))
+          last_accessed=access_history.get(str(item)),
+          last_commit=cached.get('last_commit'),
+          branch=cached.get('branch'),
+          status=cached.get('status'),
+          ahead=cached.get('ahead'),
+          behind=cached.get('behind')
         )
         repos.append(repo)
 
@@ -214,9 +267,10 @@ class LazyManagerApp(App):
         branch = repo.branch or '...'
         status = repo.status or '...'
         ahead_behind = repo.ahead_behind_display
-        table.add_row(repo.name, branch, status, ahead_behind, last_accessed, last_commit)
+        loading = '⟳' if repo.is_loading else ''
+        table.add_row(repo.name, branch, status, ahead_behind, last_accessed, last_commit, loading)
     else:
-      table.add_row(f'No git repositories found in {self.base_path}', '', '', '', '', '')
+      table.add_row(f'No git repositories found in {self.base_path}', '', '', '', '', '', '')
 
   def compose(self) -> ComposeResult:
     yield Header()
@@ -231,7 +285,7 @@ class LazyManagerApp(App):
     self.sub_title = 'Select a repository (sorted by last accessed)'
 
     table = self.query_one(DataTable)
-    table.add_columns('Repository', 'Branch', 'Status', '↑↓', 'Last Accessed', 'Last Commit')
+    table.add_columns('Repository', 'Branch', 'Status', '↑↓', 'Last Accessed', 'Last Commit', '')
 
     self.repos = find_git_repos(self.base_path)
     self.refresh_list()
@@ -267,14 +321,29 @@ class LazyManagerApp(App):
     repo.branch = get_git_branch(repo.path)
     repo.status = get_git_status(repo.path)
     repo.ahead, repo.behind = get_git_ahead_behind(repo.path)
+    repo.is_loading = False
     return repo
+
+  def save_repo_to_cache(self, repo: Repository) -> None:
+    metadata_cache = load_metadata_cache()
+    metadata_cache[str(repo.path)] = {
+      'branch': repo.branch,
+      'status': repo.status,
+      'ahead': repo.ahead,
+      'behind': repo.behind,
+      'last_commit': repo.last_commit
+    }
+    save_metadata_cache(metadata_cache)
 
   def load_metadata_async(self) -> None:
     self.run_worker(self.load_all_metadata(), exclusive=False)
 
   async def load_all_metadata(self) -> None:
     for repo in self.repos:
+      repo.is_loading = True
+      self.refresh_list()
       await asyncio.to_thread(self.fetch_repo_metadata, repo)
+      self.save_repo_to_cache(repo)
       self.refresh_list()
 
   def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
