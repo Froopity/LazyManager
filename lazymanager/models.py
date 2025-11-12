@@ -30,6 +30,7 @@ class Repository:
   ahead: int | None = None
   behind: int | None = None
   is_loading: bool = False
+  needs_refresh: bool = False
   has_error: bool = False
   has_upstream: bool | None = None
 

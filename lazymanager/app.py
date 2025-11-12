@@ -2,10 +2,14 @@ import asyncio
 import logging
 import shutil
 import subprocess
+import threading
 from datetime import datetime
+from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.widgets import DataTable, Footer, Header, TextArea
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 from .config import (load_access_history, load_config, load_metadata_cache,
                      save_access_history, save_metadata_cache)
@@ -16,6 +20,31 @@ from .repository import find_git_repos
 from .widgets import ErrorConsole, RepositoryPane
 
 logger = logging.getLogger('lazymanager')
+
+
+class GitChangeHandler(FileSystemEventHandler):
+  def __init__(self, app, repo):
+    self.app = app
+    self.repo = repo
+    self.debounce_timer = None
+
+  def on_any_event(self, event):
+    if event.is_directory:
+      return
+
+    path = Path(event.src_path)
+    if path.name in ('index.lock', 'HEAD.lock', '.git.lock'):
+      return
+
+    if self.debounce_timer:
+      self.debounce_timer.cancel()
+
+    self.debounce_timer = threading.Timer(1.0, self._flag_needs_refresh)
+    self.debounce_timer.start()
+
+  def _flag_needs_refresh(self):
+    self.repo.needs_refresh = True
+    self.app.call_from_thread(self.app.refresh_list)
 
 
 class LazyManagerApp(App):
@@ -30,6 +59,7 @@ class LazyManagerApp(App):
     ('n', 'sort_name', 'Name'),
     ('a', 'sort_accessed', 'Accessed'),
     ('c', 'sort_commit', 'Commit'),
+    ('r', 'refresh', 'Refresh'),
     ('e', 'toggle_errors', 'e Errors'),
     ('1', 'focus_table', ''),
     ('2', 'focus_errors', ''),
@@ -43,6 +73,7 @@ class LazyManagerApp(App):
     self.sort_method = 'accessed'
     self.metadata_cache = {}
     self.access_history = {}
+    self.observer = None
 
   def get_sorted_repos(self):
     if self.sort_method == 'name':
@@ -66,8 +97,8 @@ class LazyManagerApp(App):
         branch = repo.branch if repo.branch else ('!' if repo.has_error else '...')
         status = repo.status if repo.status else ('!' if repo.has_error else '...')
         ahead_behind = repo.ahead_behind_display if not repo.has_error else '!'
-        loading = '⟳' if repo.is_loading else ''
-        table.add_row(repo.name, branch, status, ahead_behind, last_accessed, last_commit, loading)
+        refresh_indicator = '⟳' if repo.needs_refresh else ''
+        table.add_row(repo.name, branch, status, ahead_behind, last_accessed, last_commit, refresh_indicator)
 
       if cursor_row < len(sorted_repos):
         table.move_cursor(row=cursor_row)
@@ -97,6 +128,7 @@ class LazyManagerApp(App):
       self.refresh_list()
 
       self.load_metadata_async()
+      self.start_watching()
     except Exception as e:
       logger.exception('Error during mount')
 
@@ -114,6 +146,11 @@ class LazyManagerApp(App):
     self.sort_method = 'commit'
     self.sub_title = 'Select a repository (sorted by last commit)'
     self.refresh_list()
+
+  def action_refresh(self) -> None:
+    repos_to_refresh = [repo for repo in self.repos if repo.needs_refresh]
+    if repos_to_refresh:
+      self.run_worker(self.refresh_repos_metadata(repos_to_refresh), exclusive=False)
 
   def action_toggle_errors(self, shift: bool = False) -> None:
     logger.debug(f'Toggling error console (shift={shift})')
@@ -178,7 +215,6 @@ class LazyManagerApp(App):
       repo.has_upstream = None
     repo.has_error = repo.has_error or ahead_behind_result.has_error
 
-    repo.is_loading = False
     return repo
 
   def save_repo_to_cache(self, repo: Repository) -> None:
@@ -196,10 +232,6 @@ class LazyManagerApp(App):
 
   async def load_all_metadata(self) -> None:
     try:
-      for repo in self.repos:
-        repo.is_loading = True
-      self.refresh_list()
-
       tasks = [asyncio.to_thread(self.fetch_repo_metadata, repo) for repo in self.repos]
       await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -210,6 +242,54 @@ class LazyManagerApp(App):
       self.refresh_list()
     except Exception as e:
       logger.exception('Error in load_all_metadata')
+
+  async def refresh_repos_metadata(self, repos) -> None:
+    try:
+      tasks = [asyncio.to_thread(self.fetch_repo_metadata, repo) for repo in repos]
+      await asyncio.gather(*tasks, return_exceptions=True)
+
+      for repo in repos:
+        repo.needs_refresh = False
+        self.save_repo_to_cache(repo)
+
+      save_metadata_cache(self.metadata_cache)
+      self.refresh_list()
+    except Exception as e:
+      logger.exception('Error in refresh_repos_metadata')
+
+  def start_watching(self):
+    self.observer = Observer()
+
+    for repo in self.repos:
+      git_dir = repo.path / '.git'
+      if not git_dir.exists():
+        continue
+
+      handler = GitChangeHandler(self, repo)
+
+      watch_paths = [
+        git_dir / 'HEAD',
+        git_dir / 'index',
+        git_dir / 'FETCH_HEAD',
+        git_dir / 'refs' / 'heads'
+      ]
+
+      for watch_path in watch_paths:
+        if watch_path.exists():
+          self.observer.schedule(handler, str(watch_path), recursive=(watch_path.name == 'heads'))
+
+    self.observer.start()
+    logger.info(f'Started watching {len(self.repos)} repositories')
+
+  def reload_metadata_and_refresh(self):
+    self.load_metadata_async()
+
+  def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+    sorted_repos = self.get_sorted_repos()
+    if event.cursor_row < len(sorted_repos):
+      repo = sorted_repos[event.cursor_row]
+      if repo.needs_refresh:
+        self.run_worker(self.refresh_repos_metadata([repo]), exclusive=False)
 
   def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
     sorted_repos = self.get_sorted_repos()
@@ -236,3 +316,9 @@ class LazyManagerApp(App):
         print(f'Error running lazygit: {e}')
 
     self.refresh_list()
+
+  def on_unmount(self) -> None:
+    if self.observer:
+      self.observer.stop()
+      self.observer.join()
+      logger.info('Stopped file system watcher')

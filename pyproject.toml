@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "A TUI for managing multiple git repositories with lazygit integration"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = ["textual"]
+dependencies = ["textual", "watchdog"]
 
 [project.scripts]
 lazymanager = "lazymanager.lazymanager:main"
