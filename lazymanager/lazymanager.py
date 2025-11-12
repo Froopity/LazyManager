@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -21,6 +22,7 @@ logger = logging.getLogger('lazymanager')
 def main():
   try:
     logger.info('Starting LazyManager')
+    os.system('echo "\033]0;%s\007"' % 'lazymanager')
     app = LazyManagerApp()
     app.run()
   except Exception as e:
