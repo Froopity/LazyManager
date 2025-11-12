@@ -1,7 +1,14 @@
 [project]
 name = "lazymanager"
 version = "0.1.0"
-description = "Add your description here"
+description = "A TUI for managing multiple git repositories with lazygit integration"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = ["textual"]
+
+[project.scripts]
+lazymanager = "lazymanager.lazymanager:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
