@@ -1,6 +1,22 @@
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Generic, TypeVar
+
+T = TypeVar('T')
+
+
+@dataclass
+class GitResult(Generic[T]):
+  value: T | None
+  has_error: bool
+
+
+@dataclass
+class AheadBehindInfo:
+  ahead: int | None
+  behind: int | None
+  has_upstream: bool
 
 
 @dataclass

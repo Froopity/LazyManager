@@ -1,12 +1,13 @@
 import asyncio
 import logging
+import shutil
 import subprocess
 from datetime import datetime
 
 from textual.app import App, ComposeResult
 from textual.widgets import DataTable, Footer, Header, TextArea
 
-from .config import (load_access_history, load_metadata_cache,
+from .config import (load_access_history, load_config, load_metadata_cache,
                      save_access_history, save_metadata_cache)
 from .git_utils import (get_git_ahead_behind, get_git_branch, get_git_status,
                         get_last_commit_date)
@@ -34,11 +35,14 @@ class LazyManagerApp(App):
     ('2', 'focus_errors', ''),
   ]
 
-  def __init__(self, base_path='C:\\Work\\source'):
+  def __init__(self, base_path=None):
     super().__init__()
-    self.base_path = base_path
+    config = load_config()
+    self.base_path = base_path or config.get('base_path')
     self.repos = []
     self.sort_method = 'accessed'
+    self.metadata_cache = {}
+    self.access_history = {}
 
   def get_sorted_repos(self):
     if self.sort_method == 'name':
@@ -85,7 +89,10 @@ class LazyManagerApp(App):
       table = self.query_one(DataTable)
       table.add_columns('Repository', 'Branch', 'Status', '↑↓', 'Last Accessed', 'Last Commit', '')
 
-      self.repos = find_git_repos(self.base_path)
+      self.metadata_cache = load_metadata_cache()
+      self.access_history = load_access_history()
+
+      self.repos = find_git_repos(self.base_path, self.access_history, self.metadata_cache)
       logger.info(f'Found {len(self.repos)} repositories')
       self.refresh_list()
 
@@ -148,37 +155,41 @@ class LazyManagerApp(App):
   def fetch_repo_metadata(self, repo: Repository) -> Repository:
     repo.has_error = False
 
-    commit_date, has_error = get_last_commit_date(repo.path, self.log_error)
-    repo.last_commit = commit_date
-    repo.has_error = repo.has_error or has_error
+    commit_result = get_last_commit_date(repo.path, self.log_error)
+    repo.last_commit = commit_result.value
+    repo.has_error = repo.has_error or commit_result.has_error
 
-    branch, has_error = get_git_branch(repo.path, self.log_error)
-    repo.branch = branch
-    repo.has_error = repo.has_error or has_error
+    branch_result = get_git_branch(repo.path, self.log_error)
+    repo.branch = branch_result.value
+    repo.has_error = repo.has_error or branch_result.has_error
 
-    status, has_error = get_git_status(repo.path, self.log_error)
-    repo.status = status
-    repo.has_error = repo.has_error or has_error
+    status_result = get_git_status(repo.path, self.log_error)
+    repo.status = status_result.value
+    repo.has_error = repo.has_error or status_result.has_error
 
-    ahead, behind, has_upstream, has_error = get_git_ahead_behind(repo.path, self.log_error)
-    repo.ahead = ahead
-    repo.behind = behind
-    repo.has_upstream = has_upstream
-    repo.has_error = repo.has_error or has_error
+    ahead_behind_result = get_git_ahead_behind(repo.path, self.log_error)
+    if ahead_behind_result.value:
+      repo.ahead = ahead_behind_result.value.ahead
+      repo.behind = ahead_behind_result.value.behind
+      repo.has_upstream = ahead_behind_result.value.has_upstream
+    else:
+      repo.ahead = None
+      repo.behind = None
+      repo.has_upstream = None
+    repo.has_error = repo.has_error or ahead_behind_result.has_error
 
     repo.is_loading = False
     return repo
 
   def save_repo_to_cache(self, repo: Repository) -> None:
-    metadata_cache = load_metadata_cache()
-    metadata_cache[str(repo.path)] = {
+    self.metadata_cache[str(repo.path)] = {
       'branch': repo.branch,
       'status': repo.status,
       'ahead': repo.ahead,
       'behind': repo.behind,
+      'has_upstream': repo.has_upstream,
       'last_commit': repo.last_commit
     }
-    save_metadata_cache(metadata_cache)
 
   def load_metadata_async(self) -> None:
     self.run_worker(self.load_all_metadata(), exclusive=False)
@@ -186,16 +197,17 @@ class LazyManagerApp(App):
   async def load_all_metadata(self) -> None:
     try:
       for repo in self.repos:
-        try:
-          repo.is_loading = True
-          self.refresh_list()
-          await asyncio.to_thread(self.fetch_repo_metadata, repo)
-          self.save_repo_to_cache(repo)
-          self.refresh_list()
-        except Exception as e:
-          logger.exception(f'Error loading metadata for {repo.name}')
-          repo.is_loading = False
-          self.refresh_list()
+        repo.is_loading = True
+      self.refresh_list()
+
+      tasks = [asyncio.to_thread(self.fetch_repo_metadata, repo) for repo in self.repos]
+      await asyncio.gather(*tasks, return_exceptions=True)
+
+      for repo in self.repos:
+        self.save_repo_to_cache(repo)
+
+      save_metadata_cache(self.metadata_cache)
+      self.refresh_list()
     except Exception as e:
       logger.exception('Error in load_all_metadata')
 
@@ -206,18 +218,21 @@ class LazyManagerApp(App):
       self.run_lazygit(repo)
 
   def run_lazygit(self, repo: Repository) -> None:
-    access_history = load_access_history()
-    access_history[str(repo.path)] = datetime.now()
-    save_access_history(access_history)
+    self.access_history[str(repo.path)] = datetime.now()
+    save_access_history(self.access_history)
 
-    repo.last_accessed = access_history[str(repo.path)]
+    repo.last_accessed = self.access_history[str(repo.path)]
+
+    lazygit_cmd = shutil.which('lazygit') or shutil.which('lazygit.exe')
+    if not lazygit_cmd:
+      with self.suspend():
+        print('Error: lazygit not found. Please install lazygit first.')
+        input('Press Enter to continue...')
+      return
 
     with self.suspend():
       try:
-        subprocess.run(['lazygit.exe'], cwd=str(repo.path))
-      except FileNotFoundError:
-        print('Error: lazygit not found. Please install lazygit first.')
-        input('Press Enter to continue...')
+        subprocess.run([lazygit_cmd], cwd=str(repo.path))
       except Exception as e:
         print(f'Error running lazygit: {e}')
         input('Press Enter to continue...')
