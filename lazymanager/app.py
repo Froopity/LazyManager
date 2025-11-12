@@ -30,7 +30,7 @@ class LazyManagerApp(App):
     ('n', 'sort_name', 'Name'),
     ('a', 'sort_accessed', 'Accessed'),
     ('c', 'sort_commit', 'Commit'),
-    ('e,E', 'toggle_errors', 'e/E Errors'),
+    ('e', 'toggle_errors', 'e Errors'),
     ('1', 'focus_table', ''),
     ('2', 'focus_errors', ''),
   ]
@@ -227,7 +227,6 @@ class LazyManagerApp(App):
     if not lazygit_cmd:
       with self.suspend():
         print('Error: lazygit not found. Please install lazygit first.')
-        input('Press Enter to continue...')
       return
 
     with self.suspend():
@@ -235,6 +234,5 @@ class LazyManagerApp(App):
         subprocess.run([lazygit_cmd], cwd=str(repo.path))
       except Exception as e:
         print(f'Error running lazygit: {e}')
-        input('Press Enter to continue...')
 
     self.refresh_list()
