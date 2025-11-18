@@ -28,7 +28,7 @@ def main():
 
   try:
     logger.info('Starting LazyManager')
-    os.system('echo "\033]0;%s\007"' % 'lazymanager')
+    os.system('echo \033]0;%s\007' % 'lazymanager')
     app = LazyManagerApp(base_path=args.base_path)
     app.run()
   except Exception as e:

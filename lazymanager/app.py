@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import shutil
 import subprocess
 import threading
@@ -315,6 +316,7 @@ class LazyManagerApp(App):
       except Exception as e:
         print(f'Error running lazygit: {e}')
 
+    os.system('echo \033]0;%s\007' % 'lazymanager')
     self.refresh_list()
 
   def on_unmount(self) -> None:
